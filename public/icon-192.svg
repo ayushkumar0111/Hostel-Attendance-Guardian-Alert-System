@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <rect width="192" height="192" rx="36" fill="#0a2540"/>
+  <circle cx="96" cy="96" r="74" fill="none" stroke="#d4af37" stroke-width="4"/>
+  <path d="M96 36 L144 56 V100 C144 130 96 156 96 156 C96 156 48 130 48 100 V56 Z" fill="#133a63" stroke="#d4af37" stroke-width="4"/>
+  <text x="96" y="98" font-family="Arial, sans-serif" font-weight="900" font-size="34" fill="#ffffff" text-anchor="middle" dominant-baseline="central">CT</text>
+  <text x="96" y="128" font-family="Arial, sans-serif" font-weight="bold" font-size="11" fill="#d4af37" text-anchor="middle">HOSTEL</text>
+</svg>

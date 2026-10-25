@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
+    <meta name="theme-color" content="#0a2540" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="CT Hostel" />
+    <meta name="application-name" content="CT Hostel" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta name="description" content="CT GROUP OF INSTITUTIONS - Hostel Attendance & Guardian Alert System developed by CT, built by Ayush Kumar" />
+    
+    <!-- Icons for PWA, Android Chrome, and iOS -->
+    <link rel="icon" type="image/svg+xml" href="/icon-192.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png" />
+    <link rel="apple-touch-icon" sizes="192x192" href="/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="512x512" href="/icon-512.png" />
+    <link rel="manifest" href="/manifest.json" />
+
+    <title>CT GROUP OF INSTITUTIONS | Hostel Attendance System</title>
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased min-h-screen selection:bg-amber-400 selection:text-slate-900">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if ('serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').then(
+            (reg) => {
+              console.log('[CT Hostel PWA] ServiceWorker registered with scope:', reg.scope);
+            },
+            (err) => {
+              console.warn('[CT Hostel PWA] ServiceWorker registration skipped/failed:', err);
+            }
+          );
+        });
+      }
+    </script>
+  </body>
+</html>
