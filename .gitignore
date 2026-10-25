@@ -30,6 +30,7 @@ dist-ssr
 scratch/
 supabase/.temp/
 test_results.json
+push_to_github.bat
 
 # Environment files containing secrets
 .env
