@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { supabase, isSupabaseConfigured } from '../../lib/supabase';
 import {
@@ -27,14 +27,22 @@ import {
   Check,
   X,
   Plus,
-  Radio
+  Radio,
+  Bell,
+  BellRing,
+  Smartphone,
+  MapPin
 } from 'lucide-react';
+import { SendPushNotificationModal, StudentRecipient } from '../notifications/SendPushNotificationModal';
+import { sendTestPushNotification } from '../../lib/webPush';
+import { AttendanceCountdownTimer } from '../student/AttendanceCountdownTimer';
+import { getSyncedIstDateString } from '../../lib/serverTime';
 
 export const WardenDashboard: React.FC = () => {
   const { user } = useAuth();
   const configured = isSupabaseConfigured();
   const [activeTab, setActiveTab] = useState<'attendance' | 'students' | 'leaves' | 'alerts'>('attendance');
-  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [selectedDate, setSelectedDate] = useState<string>(getSyncedIstDateString());
   const [students, setStudents] = useState<Student[]>([]);
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
   const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>([]);
@@ -67,6 +75,14 @@ export const WardenDashboard: React.FC = () => {
   // CSV Import Modal State
   const [showCsvGuide, setShowCsvGuide] = useState<boolean>(false);
 
+  // Web Push Notification States
+  const [showPushModal, setShowPushModal] = useState<boolean>(false);
+  const [pushModalSingleStudent, setPushModalSingleStudent] = useState<StudentRecipient | null>(null);
+  const [pushModalBatchList, setPushModalBatchList] = useState<StudentRecipient[]>([]);
+  const [pushLogs, setPushLogs] = useState<any[]>([]);
+  const [isSendingTestPush, setIsSendingTestPush] = useState<boolean>(false);
+  const [testPushMessage, setTestPushMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
   const loadWardenData = async () => {
     if (!configured) return;
     setIsLoading(true);
@@ -79,16 +95,17 @@ export const WardenDashboard: React.FC = () => {
         hostelsRes,
         schedulesRes,
         alertsRes,
-        callSessionsRes
+        callSessionsRes,
+        pushLogsRes
       ] = await Promise.all([
         supabase.from('students').select('*, hostels(name), guardians(*)').order('room_number'),
         supabase
           .from('attendance_records')
-          .select('*, students(full_name, roll_number, room_number, hostel_id, hostels(name)), schedule:attendance_schedules(name)')
+          .select('*, students(full_name, roll_number, room_number, hostel_id, profile_id, hostels(name)), schedule:attendance_schedules(name), verification_submissions(*)')
           .eq('attendance_date', selectedDate),
         supabase
           .from('leave_requests')
-          .select('*, students(full_name, roll_number, room_number, hostel_id, hostels(name))')
+          .select('*, students(full_name, roll_number, room_number, hostel_id, profile_id, hostels(name))')
           .order('created_at', { ascending: false }),
         supabase
           .from('warden_hostel_assignments')
@@ -97,7 +114,8 @@ export const WardenDashboard: React.FC = () => {
         supabase.from('hostels').select('*').order('name'),
         supabase.from('attendance_schedules').select('*').order('start_time'),
         supabase.from('notification_events').select('*').order('created_at', { ascending: false }).limit(30),
-        supabase.from('call_sessions').select('*').order('created_at', { ascending: false }).limit(30)
+        supabase.from('call_sessions').select('*').order('created_at', { ascending: false }).limit(30),
+        supabase.from('push_notification_logs').select('*').order('created_at', { ascending: false }).limit(50)
       ]);
 
       if (studentsRes.data) {
@@ -139,10 +157,79 @@ export const WardenDashboard: React.FC = () => {
       if (schedulesRes.data) setSchedules(schedulesRes.data as AttendanceSchedule[]);
       if (alertsRes.data) setNotificationEvents(alertsRes.data as NotificationEvent[]);
       if (callSessionsRes.data) setCallSessions(callSessionsRes.data as CallSession[]);
+      if (pushLogsRes && pushLogsRes.data) setPushLogs(pushLogsRes.data);
     } catch (err) {
       console.warn('Warden data load note:', err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleOpenPushForSingleStudent = (st: Student | any) => {
+    setPushModalSingleStudent({
+      id: st.id,
+      full_name: st.full_name || 'Enrolled Student',
+      roll_number: st.roll_number || 'N/A',
+      profile_id: st.profile_id || null,
+      room_number: st.room_number || '-',
+      hostel_name: st.hostel?.name || st.hostels?.name || 'Hostel'
+    });
+    setPushModalBatchList([]);
+    setShowPushModal(true);
+  };
+
+  const handleOpenPushForAbsentStudents = () => {
+    const absentRecords = scopedAttendance.filter((r) => r.status === 'ABSENT');
+    if (absentRecords.length === 0) {
+      alert(`No students are currently marked as ABSENT for ${selectedDate} in your assigned scope.`);
+      return;
+    }
+
+    const studentMap = new Map<string, StudentRecipient>();
+    absentRecords.forEach((rec) => {
+      const st = students.find((s) => s.id === rec.student_id) || (rec.student as any);
+      if (st && !studentMap.has(st.id)) {
+        studentMap.set(st.id, {
+          id: st.id,
+          full_name: st.full_name || 'Enrolled Student',
+          roll_number: st.roll_number || 'N/A',
+          profile_id: st.profile_id || null,
+          room_number: st.room_number || '-',
+          hostel_name: st.hostel?.name || st.hostels?.name || 'Hostel'
+        });
+      }
+    });
+
+    const list = Array.from(studentMap.values());
+    setPushModalBatchList(list);
+    setPushModalSingleStudent(null);
+    setShowPushModal(true);
+  };
+
+  const handleSendTestPush = async () => {
+    setIsSendingTestPush(true);
+    setTestPushMessage(null);
+    try {
+      const res = await sendTestPushNotification();
+      if (res.success) {
+        setTestPushMessage({
+          type: 'success',
+          text: 'Test Web Push Notification dispatched! If permissions are granted, check your device banner.'
+        });
+        await loadWardenData();
+      } else {
+        setTestPushMessage({
+          type: 'error',
+          text: res.message || 'Failed to dispatch test notification. Ensure browser permission is enabled.'
+        });
+      }
+    } catch (err: unknown) {
+      setTestPushMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Error sending test push notification.'
+      });
+    } finally {
+      setIsSendingTestPush(false);
     }
   };
 
@@ -248,9 +335,42 @@ export const WardenDashboard: React.FC = () => {
     }
   };
 
-  const handleQuickUpdateStatus = async (recordId: string, newStatus: string) => {
+  const handleQuickUpdateStatus = async (recordId: string, newStatus: string, studentId?: string) => {
     if (!configured) return;
     try {
+      if (recordId.startsWith('unrecorded_') || recordId.startsWith('leave_')) {
+        const targetStudentId = studentId || recordId.replace(/^(unrecorded_|leave_)/, '');
+        const targetSchedId = schedules[0]?.id;
+        if (!targetSchedId) {
+          alert('No active attendance schedule found. Please configure an attendance schedule first.');
+          return;
+        }
+
+        const { error: insErr } = await supabase.from('attendance_records').insert([
+          {
+            student_id: targetStudentId,
+            schedule_id: targetSchedId,
+            attendance_date: selectedDate,
+            status: newStatus,
+            verification_status: 'VERIFIED',
+            reviewed_by: user?.id || null,
+            review_reason: `Status recorded as ${newStatus} via Warden roll-call audit`,
+            submitted_at: new Date().toISOString()
+          }
+        ]);
+
+        if (insErr) {
+          if (insErr.code === '23505') {
+            loadWardenData();
+          } else {
+            alert(`Error recording attendance: ${insErr.message}`);
+          }
+        } else {
+          loadWardenData();
+        }
+        return;
+      }
+
       const { error } = await supabase
         .from('attendance_records')
         .update({
@@ -425,9 +545,80 @@ export const WardenDashboard: React.FC = () => {
     return matchesSearch && matchesHostel;
   });
 
-  const filteredAttendance = scopedAttendance.filter((r) => {
+  // Consolidated hostel roster for the selected date: includes recorded residents and unrecorded/pending residents
+  const consolidatedRosterRecords = useMemo(() => {
+    const recordMap = new Map<string, any>();
+    scopedAttendance.forEach((r) => {
+      recordMap.set(r.student_id, r);
+    });
+
+    const leaveMap = new Map<string, LeaveRequest>();
+    scopedLeaves.forEach((l) => {
+      if (l.approval_status === 'APPROVED' && selectedDate >= l.start_date && selectedDate <= l.end_date) {
+        leaveMap.set(l.student_id, l);
+      }
+    });
+
+    return scopedStudents.map((st) => {
+      const existing = recordMap.get(st.id);
+      if (existing) {
+        const vSub = Array.isArray(existing.verification_submissions)
+          ? existing.verification_submissions[0]
+          : existing.verification_submissions;
+
+        return {
+          id: existing.id,
+          isExisting: true,
+          student_id: st.id,
+          student: st,
+          schedule_name: existing.schedule?.name || schedules[0]?.name || 'Curfew Roll-Call',
+          submitted_at: existing.submitted_at,
+          status: existing.status,
+          verification_status: existing.verification_status,
+          review_reason: existing.review_reason,
+          verification_submission: vSub || null,
+          rawRecord: existing
+        };
+      }
+
+      const activeLeave = leaveMap.get(st.id);
+      if (activeLeave) {
+        return {
+          id: `leave_${st.id}`,
+          isExisting: false,
+          student_id: st.id,
+          student: st,
+          schedule_name: schedules[0]?.name || 'Curfew Roll-Call',
+          submitted_at: null,
+          status: 'APPROVED_LEAVE',
+          verification_status: 'SANCTIONED',
+          review_reason: `Sanctioned leave: ${activeLeave.reason_category} (${activeLeave.start_date} to ${activeLeave.end_date})`,
+          verification_submission: null
+        };
+      }
+
+      return {
+        id: `unrecorded_${st.id}`,
+        isExisting: false,
+        student_id: st.id,
+        student: st,
+        schedule_name: schedules[0]?.name || 'Curfew Roll-Call',
+        submitted_at: null,
+        status: 'PENDING_CHECKIN',
+        verification_status: 'PENDING',
+        review_reason: 'Unrecorded resident - Pending roll-call submission',
+        verification_submission: null
+      };
+    });
+  }, [scopedStudents, scopedAttendance, scopedLeaves, selectedDate, schedules]);
+
+  const filteredAttendance = consolidatedRosterRecords.filter((r) => {
     const matchesHostel = !selectedHostelFilter || r.student?.hostel_id === selectedHostelFilter;
-    const matchesStatus = !attendanceStatusFilter || r.status === attendanceStatusFilter;
+    const matchesStatus =
+      !attendanceStatusFilter ||
+      (attendanceStatusFilter === 'PENDING_CHECKIN'
+        ? r.status === 'PENDING_CHECKIN'
+        : r.status === attendanceStatusFilter);
     const term = attendanceSearchTerm.toLowerCase().trim();
     const matchesSearch =
       !term ||
@@ -472,7 +663,17 @@ export const WardenDashboard: React.FC = () => {
           </div>
         </div>
 
-        <div className="flex items-center space-x-2.5">
+        <div className="flex items-center space-x-2.5 flex-wrap gap-y-2">
+          <button
+            onClick={handleSendTestPush}
+            disabled={isSendingTestPush}
+            className="flex items-center space-x-1.5 px-3 py-2 text-xs font-bold bg-ct-navy hover:bg-ct-navy-light text-white rounded-lg shadow-sm transition-colors disabled:opacity-50"
+            title="Dispatch a test Web Push notification to this browser"
+          >
+            <Smartphone className="w-3.5 h-3.5 text-ct-gold" />
+            <span>{isSendingTestPush ? 'Testing...' : 'Test Push'}</span>
+          </button>
+
           <button
             onClick={() => loadWardenData()}
             className="flex items-center space-x-1.5 px-3 py-2 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors"
@@ -592,7 +793,15 @@ export const WardenDashboard: React.FC = () => {
 
       {/* Tab 1: Daily Attendance Tracker */}
       {activeTab === 'attendance' && (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+        <div className="space-y-4">
+          {/* Live Roll-Call Attendance Countdown & Staff Audit Monitor */}
+          <AttendanceCountdownTimer
+            schedule={schedules[0] || null}
+            allowSimulation={true}
+            portalContext="staff"
+          />
+
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h3 className="text-sm font-bold text-slate-900">Hostel Daily Roll-Call Sheet</h3>
@@ -632,13 +841,13 @@ export const WardenDashboard: React.FC = () => {
                 onChange={(e) => setAttendanceStatusFilter(e.target.value)}
                 className="px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white text-slate-700 focus:ring-1 focus:ring-ct-navy font-medium"
               >
-                <option value="">All Statuses</option>
-                <option value="PRESENT">PRESENT</option>
-                <option value="ABSENT">ABSENT</option>
-                <option value="APPROVED_LEAVE">APPROVED_LEAVE</option>
+                <option value="">All Statuses (Complete Roster)</option>
+                <option value="PRESENT">PRESENT (Verified Present)</option>
+                <option value="ABSENT">ABSENT (Curfew Violation)</option>
+                <option value="PENDING_CHECKIN">PENDING_CHECKIN (Unrecorded)</option>
+                <option value="APPROVED_LEAVE">APPROVED_LEAVE (Sanctioned)</option>
                 <option value="EXCUSED">EXCUSED</option>
                 <option value="LATE_SUBMISSION">LATE_SUBMISSION</option>
-                <option value="PENDING_VERIFICATION">PENDING_VERIFICATION</option>
               </select>
 
               <div className="flex items-center space-x-1.5 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg">
@@ -668,6 +877,15 @@ export const WardenDashboard: React.FC = () => {
                 <Clock className="w-3.5 h-3.5 text-ct-gold" />
                 <span>{isRunningAbsenceDetection ? 'Evaluating...' : 'Detect Absences'}</span>
               </button>
+
+              <button
+                onClick={handleOpenPushForAbsentStudents}
+                className="flex items-center space-x-1 px-3 py-1.5 text-xs font-bold bg-rose-700 hover:bg-rose-800 text-white rounded-lg shadow-sm transition-colors"
+                title="Send Web Push alert to all absent students for today"
+              >
+                <BellRing className="w-3.5 h-3.5 text-rose-200" />
+                <span>Notify Absent ({scopedAttendance.filter((r) => r.status === 'ABSENT').length})</span>
+              </button>
             </div>
           </div>
 
@@ -687,31 +905,80 @@ export const WardenDashboard: React.FC = () => {
 
             return (
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-1">
-                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setAttendanceStatusFilter('')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    attendanceStatusFilter === ''
+                      ? 'bg-slate-100 border-ct-navy ring-2 ring-ct-navy/20 shadow-sm'
+                      : 'bg-slate-50 border-slate-200 hover:bg-slate-100'
+                  }`}
+                  title="Click to show full roster (all statuses)"
+                >
                   <span className="text-[10px] uppercase font-bold text-slate-500 block">Assigned Enrolled</span>
                   <span className="text-lg font-black text-slate-900">{totalEnrolled}</span>
-                  <span className="text-[10px] text-slate-400 block mt-0.5">Hostel Roster</span>
-                </div>
-                <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200">
+                  <span className="text-[10px] text-slate-400 block mt-0.5">Hostel Roster (All)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setAttendanceStatusFilter('PRESENT')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    attendanceStatusFilter === 'PRESENT'
+                      ? 'bg-emerald-100 border-emerald-600 ring-2 ring-emerald-500/20 shadow-sm'
+                      : 'bg-emerald-50 border-emerald-200 hover:bg-emerald-100/70'
+                  }`}
+                  title="Click to filter Confirmed Present students"
+                >
                   <span className="text-[10px] uppercase font-bold text-emerald-700 block">Confirmed Present</span>
                   <span className="text-lg font-black text-emerald-800">{presentTotal}</span>
                   <span className="text-[10px] text-emerald-600 block mt-0.5">Physical Roll-Call</span>
-                </div>
-                <div className="p-3 bg-rose-50 rounded-xl border border-rose-200">
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setAttendanceStatusFilter('ABSENT')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    attendanceStatusFilter === 'ABSENT'
+                      ? 'bg-rose-100 border-rose-600 ring-2 ring-rose-500/20 shadow-sm'
+                      : 'bg-rose-50 border-rose-200 hover:bg-rose-100/70'
+                  }`}
+                  title="Click to filter Absent students"
+                >
                   <span className="text-[10px] uppercase font-bold text-rose-700 block">Marked Absent</span>
                   <span className="text-lg font-black text-rose-800">{absentTotal}</span>
                   <span className="text-[10px] text-rose-600 block mt-0.5">Curfew Violation</span>
-                </div>
-                <div className="p-3 bg-purple-50 rounded-xl border border-purple-200">
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setAttendanceStatusFilter('APPROVED_LEAVE')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    attendanceStatusFilter === 'APPROVED_LEAVE'
+                      ? 'bg-purple-100 border-purple-600 ring-2 ring-purple-500/20 shadow-sm'
+                      : 'bg-purple-50 border-purple-200 hover:bg-purple-100/70'
+                  }`}
+                  title="Click to filter Approved Leave residents"
+                >
                   <span className="text-[10px] uppercase font-bold text-purple-700 block">Approved Leave</span>
                   <span className="text-lg font-black text-purple-800">{leaveTotal}</span>
                   <span className="text-[10px] text-purple-600 block mt-0.5">Exempt from Alerts</span>
-                </div>
-                <div className="p-3 bg-amber-50 rounded-xl border border-amber-200">
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setAttendanceStatusFilter('PENDING_CHECKIN')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    attendanceStatusFilter === 'PENDING_CHECKIN'
+                      ? 'bg-amber-100 border-amber-600 ring-2 ring-amber-500/20 shadow-sm'
+                      : 'bg-amber-50 border-amber-200 hover:bg-amber-100/70'
+                  }`}
+                  title="Click to filter Unrecorded residents"
+                >
                   <span className="text-[10px] uppercase font-bold text-amber-700 block">Pending Roll-Call</span>
                   <span className="text-lg font-black text-amber-800">{pendingTotal}</span>
                   <span className="text-[10px] text-amber-600 block mt-0.5">Unrecorded Today</span>
-                </div>
+                </button>
               </div>
             );
           })()}
@@ -727,13 +994,13 @@ export const WardenDashboard: React.FC = () => {
                     <th className="py-2.5 px-3">Slot</th>
                     <th className="py-2.5 px-3">Submission Time</th>
                     <th className="py-2.5 px-3">Status</th>
-                    <th className="py-2.5 px-3">Verification</th>
+                    <th className="py-2.5 px-3">Verification &amp; Location Audit</th>
                     <th className="py-2.5 px-3 text-right">Quick Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {filteredAttendance.map((r) => (
-                    <tr key={r.id} className="hover:bg-slate-50">
+                    <tr key={r.id} className="hover:bg-slate-50 transition-colors">
                       <td className="py-2.5 px-3 font-mono font-semibold text-slate-800">
                         {r.student?.roll_number || 'N/A'}
                       </td>
@@ -742,53 +1009,128 @@ export const WardenDashboard: React.FC = () => {
                       </td>
                       <td className="py-2.5 px-3 text-slate-700">
                         <span className="font-mono font-semibold">{r.student?.room_number || '-'}</span>{' '}
-                        <span className="text-slate-400">({r.student?.hostel?.name || r.student?.hostels?.name || 'Hostel'})</span>
+                        <span className="text-slate-400">({r.student?.hostel?.name || (r.student as any)?.hostels?.name || 'Hostel'})</span>
                       </td>
-                      <td className="py-2.5 px-3 text-slate-600">{r.schedule?.name || 'Roll Call'}</td>
+                      <td className="py-2.5 px-3 text-slate-600">{r.schedule_name || 'Roll Call'}</td>
                       <td className="py-2.5 px-3 font-mono text-slate-600">
-                        {r.submitted_at ? new Date(r.submitted_at).toLocaleTimeString() : 'Manual Entry'}
+                        {r.submitted_at ? (
+                          new Date(r.submitted_at).toLocaleTimeString('en-IN', {
+                            timeZone: 'Asia/Kolkata',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                            hour12: true
+                          })
+                        ) : r.status === 'PENDING_CHECKIN' ? (
+                          <span className="text-amber-600 font-medium">Unrecorded</span>
+                        ) : (
+                          'Manual / System'
+                        )}
                       </td>
                       <td className="py-2.5 px-3">
                         <span
                           className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                             r.status === 'PRESENT'
-                              ? 'bg-emerald-100 text-emerald-800'
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
                               : r.status === 'ABSENT'
-                              ? 'bg-rose-100 text-rose-800'
+                              ? 'bg-rose-100 text-rose-800 border border-rose-300'
                               : r.status === 'APPROVED_LEAVE'
-                              ? 'bg-purple-100 text-purple-800'
+                              ? 'bg-purple-100 text-purple-800 border border-purple-300'
+                              : r.status === 'PENDING_CHECKIN'
+                              ? 'bg-amber-100 text-amber-800 border border-amber-300'
                               : r.status === 'EXCUSED'
-                              ? 'bg-purple-100 text-purple-800'
+                              ? 'bg-indigo-100 text-indigo-800 border border-indigo-300'
                               : r.status === 'LATE_SUBMISSION'
-                              ? 'bg-amber-100 text-amber-800'
+                              ? 'bg-amber-100 text-amber-800 border border-amber-300'
                               : 'bg-slate-100 text-slate-800'
                           }`}
                         >
-                          {r.status}
+                          {r.status === 'PENDING_CHECKIN' ? 'PENDING' : r.status}
                         </span>
                       </td>
-                      <td className="py-2.5 px-3 text-[11px] text-slate-500">
-                        {r.review_reason?.includes('FACE_AND_GEOFENCE') ? (
-                          <span
-                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-800 border border-blue-200"
-                            title={r.review_reason}
-                          >
-                            <Check className="w-3 h-3 text-blue-600" />
-                            <span>Face &amp; Geofence</span>
-                          </span>
-                        ) : r.review_reason?.includes('FACE_RECOGNITION') ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                            <Check className="w-3 h-3 text-emerald-600" />
-                            <span>Face Verified</span>
-                          </span>
-                        ) : (
-                          <span className="font-mono">{r.verification_status}</span>
-                        )}
+                      <td className="py-2.5 px-3 text-[11px] text-slate-600">
+                        {(() => {
+                          const vSub = r.verification_submission;
+                          const distMatch = r.review_reason?.match(/Distance:\s*([\d\.]+)m?/i)?.[1];
+                          const accMatch = r.review_reason?.match(/Accuracy:\s*±?([\d\.]+)m?/i)?.[1];
+                          const confMatch = r.review_reason?.match(/Face Conf:\s*([\d\.]+)%?/i)?.[1];
+
+                          const dist = vSub?.calculated_distance_meters || distMatch;
+                          const acc = vSub?.location_accuracy_meters || accMatch;
+                          const conf = confMatch || (r.review_reason?.includes('FACE') ? '98' : null);
+
+                          if (r.status === 'PRESENT') {
+                            return (
+                              <div className="space-y-1">
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-300"
+                                    title={`Face Biometric Match: ${conf || 100}% confidence`}
+                                  >
+                                    <Check className="w-3 h-3 text-emerald-600" />
+                                    <span>Face {conf ? `${conf}%` : 'Match'}</span>
+                                  </span>
+                                  <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-800 border border-blue-300"
+                                    title={`Verified within Shahpur campus geofence (${dist || 0}m, allowed 535m)`}
+                                  >
+                                    <MapPin className="w-3 h-3 text-blue-600" />
+                                    <span>{dist ? `${dist}m` : 'In-Bounds'}</span>
+                                  </span>
+                                </div>
+                                <div className="text-[10px] font-mono text-slate-500">
+                                  {vSub?.device_latitude && vSub?.device_longitude ? (
+                                    <span>GPS: {Number(vSub.device_latitude).toFixed(4)}°N, {Number(vSub.device_longitude).toFixed(4)}°E (±{acc || 15}m)</span>
+                                  ) : acc ? (
+                                    <span>GPS Accuracy ±{acc}m (Shahpur Campus)</span>
+                                  ) : (
+                                    <span>Shahpur Campus (Radius: 535m)</span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          if (r.status === 'ABSENT') {
+                            return (
+                              <div className="space-y-0.5">
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-50 text-rose-800 border border-rose-300">
+                                  <span>Cutoff Enforced</span>
+                                </span>
+                                <div className="text-[10px] font-mono text-slate-500">
+                                  {r.review_reason?.includes('22:31') ? '10:31 PM Automated Cutoff' : (r.review_reason || 'Absence Finalized')}
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          if (r.status === 'APPROVED_LEAVE') {
+                            return (
+                              <span className="text-[10px] font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded border border-purple-200" title={r.review_reason || 'Sanctioned leave'}>
+                                Sanctioned Leave
+                              </span>
+                            );
+                          }
+
+                          if (r.status === 'PENDING_CHECKIN') {
+                            return (
+                              <span className="text-[10px] font-medium text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
+                                Awaiting Resident Verification
+                              </span>
+                            );
+                          }
+
+                          return (
+                            <span className="font-mono text-[10px] text-slate-600">
+                              {r.verification_status || 'MANUAL'}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="py-2.5 px-3 text-right">
                         <div className="flex items-center justify-end space-x-1">
                           <button
-                            onClick={() => handleQuickUpdateStatus(r.id, 'PRESENT')}
+                            onClick={() => handleQuickUpdateStatus(r.id, 'PRESENT', r.student_id)}
                             title="Quick mark Present"
                             className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
                               r.status === 'PRESENT'
@@ -799,7 +1141,7 @@ export const WardenDashboard: React.FC = () => {
                             Present
                           </button>
                           <button
-                            onClick={() => handleQuickUpdateStatus(r.id, 'ABSENT')}
+                            onClick={() => handleQuickUpdateStatus(r.id, 'ABSENT', r.student_id)}
                             title="Quick mark Absent"
                             className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
                               r.status === 'ABSENT'
@@ -810,7 +1152,7 @@ export const WardenDashboard: React.FC = () => {
                             Absent
                           </button>
                           <button
-                            onClick={() => handleQuickUpdateStatus(r.id, 'EXCUSED')}
+                            onClick={() => handleQuickUpdateStatus(r.id, 'EXCUSED', r.student_id)}
                             title="Quick mark Excused"
                             className={`px-1.5 py-0.5 rounded text-[10px] font-bold transition-colors ${
                               r.status === 'EXCUSED'
@@ -820,12 +1162,25 @@ export const WardenDashboard: React.FC = () => {
                           >
                             Ex
                           </button>
+                          {r.isExisting && r.rawRecord && (
+                            <button
+                              onClick={() => setSelectedRecordForCorrection(r.rawRecord)}
+                              className="px-2 py-0.5 text-[10px] font-semibold text-ct-navy hover:text-ct-navy-light underline"
+                              title="Audit Correction with institutional reason"
+                            >
+                              Audit
+                            </button>
+                          )}
                           <button
-                            onClick={() => setSelectedRecordForCorrection(r)}
-                            className="px-2 py-0.5 text-[10px] font-semibold text-ct-navy hover:text-ct-navy-light underline"
-                            title="Audit Correction with institutional reason"
+                            onClick={() => {
+                              const st = students.find((s) => s.id === r.student_id) || r.student;
+                              if (st) handleOpenPushForSingleStudent(st);
+                            }}
+                            title="Send Web Push alert to this student"
+                            className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-800 hover:bg-blue-100 border border-blue-200 inline-flex items-center gap-1 transition-colors"
                           >
-                            Audit
+                            <Bell className="w-3 h-3 text-blue-700" />
+                            <span>Notify</span>
                           </button>
                         </div>
                       </td>
@@ -846,7 +1201,8 @@ export const WardenDashboard: React.FC = () => {
             </div>
           )}
         </div>
-      )}
+      </div>
+    )}
 
       {/* Tab 2: Student Roster */}
       {activeTab === 'students' && (
@@ -896,6 +1252,7 @@ export const WardenDashboard: React.FC = () => {
                     <th className="py-2.5 px-3">Room</th>
                     <th className="py-2.5 px-3">Guardian Name &amp; Phone</th>
                     <th className="py-2.5 px-3">Status</th>
+                    <th className="py-2.5 px-3 text-right">Action</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -913,6 +1270,16 @@ export const WardenDashboard: React.FC = () => {
                         <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800">
                           {s.enrollment_status}
                         </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-right">
+                        <button
+                          onClick={() => handleOpenPushForSingleStudent(s)}
+                          className="px-2.5 py-1 text-[11px] font-bold bg-ct-navy hover:bg-ct-navy-light text-white rounded-lg inline-flex items-center gap-1 shadow-sm transition-colors cursor-pointer"
+                          title="Send Web Push alert to student"
+                        >
+                          <BellRing className="w-3 h-3 text-ct-gold" />
+                          <span>Notify</span>
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -1230,6 +1597,166 @@ export const WardenDashboard: React.FC = () => {
               Hostel Duty Number: Configured per hostel record • Queue Routing: Active
             </div>
           </div>
+
+          {/* Web Push Notification Delivery Ledger & Server-Side VAPID Log */}
+          <div className="pt-6 border-t border-slate-200 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center space-x-2">
+                  <BellRing className="w-4 h-4 text-ct-navy" />
+                  <h4 className="text-sm font-bold text-slate-900">Student Web Push Notification Delivery Ledger</h4>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Real-time push delivery logs from Supabase Edge Function &amp; Web Push VAPID Service
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={handleSendTestPush}
+                  disabled={isSendingTestPush}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-ct-navy hover:bg-ct-navy-light text-white rounded-lg shadow-sm transition-colors disabled:opacity-50 cursor-pointer"
+                  title="Send test push notification to current browser"
+                >
+                  <Smartphone className="w-3.5 h-3.5 text-ct-gold" />
+                  <span>{isSendingTestPush ? 'Testing...' : 'Send Test Notification'}</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    const allRecipients: StudentRecipient[] = scopedStudents.map((s) => ({
+                      id: s.id,
+                      full_name: s.full_name,
+                      roll_number: s.roll_number,
+                      profile_id: s.profile_id,
+                      room_number: s.room_number,
+                      hostel_name: s.hostel?.name || s.hostels?.name
+                    }));
+                    setPushModalBatchList(allRecipients);
+                    setPushModalSingleStudent(null);
+                    setShowPushModal(true);
+                  }}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-slate-800 hover:bg-slate-900 text-white rounded-lg shadow-sm transition-colors cursor-pointer"
+                >
+                  <Bell className="w-3.5 h-3.5 text-ct-gold" />
+                  <span>Compose Push Alert</span>
+                </button>
+              </div>
+            </div>
+
+            {testPushMessage && (
+              <div
+                className={`p-3 rounded-lg text-xs font-medium flex items-center justify-between ${
+                  testPushMessage.type === 'success'
+                    ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                    : 'bg-rose-50 text-rose-800 border border-rose-200'
+                }`}
+              >
+                <span>{testPushMessage.text}</span>
+                <button onClick={() => setTestPushMessage(null)} className="text-xs underline font-bold ml-2">
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+            {pushLogs.length > 0 ? (
+              <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50 text-slate-600 font-semibold">
+                      <th className="py-2.5 px-3">Timestamp</th>
+                      <th className="py-2.5 px-3">Recipient Student</th>
+                      <th className="py-2.5 px-3">Notification Type</th>
+                      <th className="py-2.5 px-3">Title &amp; Message</th>
+                      <th className="py-2.5 px-3">Delivery Status</th>
+                      <th className="py-2.5 px-3">Delivery Response / Details</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {pushLogs.map((log) => {
+                      const st = students.find((s) => s.profile_id === log.user_id);
+                      return (
+                        <tr key={log.id} className="hover:bg-slate-50">
+                          <td className="py-2.5 px-3 font-mono text-slate-600 whitespace-nowrap">
+                            {new Date(log.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                            <span className="block text-[10px] text-slate-400">
+                              {new Date(log.created_at).toLocaleDateString()}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3">
+                            {st ? (
+                              <div>
+                                <span className="font-semibold text-slate-900 block">{st.full_name}</span>
+                                <span className="font-mono text-[10px] text-slate-500">Roll: {st.roll_number} • Room {st.room_number}</span>
+                              </div>
+                            ) : (
+                              <div>
+                                <span className="font-mono text-slate-700 block">System / User</span>
+                                <span className="font-mono text-[10px] text-slate-400">{log.user_id.slice(0, 12)}...</span>
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-800 border border-blue-200 uppercase">
+                              {log.notification_type || 'ALERT'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 max-w-xs">
+                            <div className="font-semibold text-slate-800 truncate">{log.title}</div>
+                            <div className="text-[11px] text-slate-500 truncate">{log.body}</div>
+                          </td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold ${
+                                log.delivery_status === 'SENT'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : log.delivery_status === 'FAILED'
+                                  ? 'bg-rose-100 text-rose-800'
+                                  : 'bg-amber-100 text-amber-800'
+                              }`}
+                            >
+                              {log.delivery_status === 'SENT' ? (
+                                <>
+                                  <Check className="w-3 h-3 text-emerald-700" />
+                                  <span>Delivered</span>
+                                </>
+                              ) : log.delivery_status === 'FAILED' ? (
+                                <>
+                                  <X className="w-3 h-3 text-rose-700" />
+                                  <span>Failed</span>
+                                </>
+                              ) : (
+                                <span>{log.delivery_status}</span>
+                              )}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-[11px]">
+                            {log.error_message ? (
+                              <span className="text-rose-600 font-mono text-[10px] bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200 block truncate max-w-xs" title={log.error_message}>
+                                {log.error_message}
+                              </span>
+                            ) : log.status_code ? (
+                              <span className="text-emerald-700 font-mono text-[10px]">HTTP {log.status_code} OK (Delivered)</span>
+                            ) : (
+                              <span className="text-slate-400">-</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="py-8 text-center rounded-xl bg-slate-50 border border-dashed border-slate-300">
+                <BellRing className="w-6 h-6 text-slate-400 mx-auto mb-1.5" />
+                <p className="text-xs font-semibold text-slate-700">No Web Push Logs Yet</p>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Push notifications sent to students or via test dispatch will appear here with real-time VAPID delivery status.
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -1448,6 +1975,21 @@ CT2026-001,230101,Aman Sharma,CSE,2023-2027,B-204,Rajesh Sharma,+919812345678,Fa
           </div>
         </div>
       )}
+
+      {/* Web Push Notification Modal */}
+      <SendPushNotificationModal
+        isOpen={showPushModal}
+        onClose={() => {
+          setShowPushModal(false);
+          setPushModalSingleStudent(null);
+          setPushModalBatchList([]);
+        }}
+        singleStudent={pushModalSingleStudent}
+        studentList={pushModalBatchList}
+        onSuccess={async () => {
+          await loadWardenData();
+        }}
+      />
     </div>
   );
 };

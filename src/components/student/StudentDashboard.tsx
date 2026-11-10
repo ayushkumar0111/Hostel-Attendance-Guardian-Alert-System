@@ -21,6 +21,10 @@ import {
 import { FaceAttendanceModal } from '../biometrics/FaceAttendanceModal';
 import { FaceEnrollmentModal } from '../biometrics/FaceEnrollmentModal';
 import { hasStudentFaceTemplate } from '../../lib/faceRecognition';
+import { NotificationPermissionBanner } from './NotificationPermissionBanner';
+import { AttendanceCountdownTimer } from './AttendanceCountdownTimer';
+import { getSyncedIstDateString } from '../../lib/serverTime';
+import { runAbsenceDetection, isScheduleWindowClosed } from '../../lib/absenceDetection';
 
 export const StudentDashboard: React.FC = () => {
   const { user, profile } = useAuth();
@@ -83,14 +87,15 @@ export const StudentDashboard: React.FC = () => {
         .eq('is_active', true)
         .order('start_time');
 
+      let effectiveSchedule: AttendanceSchedule | null = null;
       if (schedules && schedules.length > 0) {
-        const primarySched = schedules[0] as AttendanceSchedule;
-        setActiveSchedule(primarySched);
+        effectiveSchedule = schedules[0] as AttendanceSchedule;
+        setActiveSchedule(effectiveSchedule);
         setActiveWindow({
-          title: primarySched.name,
-          startTime: primarySched.start_time,
-          deadlineTime: primarySched.deadline_time,
-          isOpen: primarySched.is_active
+          title: effectiveSchedule.name,
+          startTime: effectiveSchedule.start_time,
+          deadlineTime: effectiveSchedule.deadline_time,
+          isOpen: effectiveSchedule.is_active
         });
       } else {
         // Institutional Default: CT Group Shahpur Campus 9:30 PM - 10:30 PM IST Slot
@@ -106,6 +111,7 @@ export const StudentDashboard: React.FC = () => {
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         };
+        effectiveSchedule = defaultShahpurSched;
         setActiveSchedule(defaultShahpurSched);
         setActiveWindow({
           title: defaultShahpurSched.name,
@@ -173,8 +179,33 @@ export const StudentDashboard: React.FC = () => {
 
         if (records) {
           setHistory(records as AttendanceRecord[]);
-          const today = new Date().toISOString().split('T')[0];
-          const todayRecord = records.find((r) => r.attendance_date === today);
+          const today = getSyncedIstDateString();
+          let todayRecord = records.find((r) => r.attendance_date === today);
+
+          // Headless Finalization: If unrecorded and window is past 10:31 PM cutoff, run idempotent absence processing
+          if (!todayRecord && effectiveSchedule) {
+            const winStatus = isScheduleWindowClosed(effectiveSchedule);
+            if (winStatus.canFinalizeAbsences) {
+              try {
+                await runAbsenceDetection(effectiveSchedule.id, today);
+                // Re-fetch today's record after finalization
+                const { data: updatedRecord } = await supabase
+                  .from('attendance_records')
+                  .select('*, schedule:attendance_schedules(name)')
+                  .eq('student_id', student.id)
+                  .eq('attendance_date', today)
+                  .maybeSingle();
+
+                if (updatedRecord) {
+                  todayRecord = updatedRecord as AttendanceRecord;
+                  setHistory((prev) => [updatedRecord as AttendanceRecord, ...prev]);
+                }
+              } catch (autoErr) {
+                console.warn('Auto-absence detection evaluation notice:', autoErr);
+              }
+            }
+          }
+
           if (todayRecord) {
             setHasSubmittedToday(true);
             setTodaySubmission(todayRecord as AttendanceRecord);
@@ -410,6 +441,17 @@ export const StudentDashboard: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {/* Live Attendance Countdown Timer (Asia/Kolkata 09:30 PM - 10:30 PM) */}
+        <AttendanceCountdownTimer
+          schedule={activeSchedule}
+          hasSubmittedToday={false}
+        />
+
+        {/* Web Push Notification Permission & Alert Status Banner for Unlinked Student */}
+        {user?.id && (
+          <NotificationPermissionBanner userId={user.id} />
+        )}
       </div>
     );
   }
@@ -469,6 +511,11 @@ export const StudentDashboard: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Web Push Notification Permission & Alert Status Banner */}
+      {user?.id && (
+        <NotificationPermissionBanner userId={user.id} />
+      )}
 
       {/* Room Allocation & Guardian Details Card */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -569,6 +616,17 @@ export const StudentDashboard: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Live Attendance Countdown Timer (Asia/Kolkata 09:30 PM - 10:30 PM IST) */}
+      <AttendanceCountdownTimer
+        schedule={activeSchedule}
+        hasSubmittedToday={hasSubmittedToday}
+        todayStatus={todaySubmission?.status}
+        todaySubmissionTime={todaySubmission?.submitted_at}
+        onCheckInClick={handleOpenAttendanceCheckIn}
+        showEnrollmentPrompt={!hasFaceTemplate}
+        onEnrollClick={() => setShowFaceEnrollmentModal(true)}
+      />
 
       {/* Attendance Check-In Portal */}
       <div className="bg-gradient-to-br from-ct-navy to-ct-navy-light rounded-2xl p-6 text-white shadow-xl border-2 border-ct-gold/40 relative overflow-hidden">

@@ -6,6 +6,8 @@
 
 import { supabase, isSupabaseConfigured } from './supabase';
 import { AttendanceSchedule, Student, LeaveRequest, AttendanceRecord } from '../types/database';
+import { getSyncedIstDateString } from './serverTime';
+import { sendPushNotificationToUsers } from './webPush';
 
 export interface AbsenceDetectionResult {
   success: boolean;
@@ -93,7 +95,7 @@ export async function runAbsenceDetection(
     };
   }
 
-  const today = targetDate || new Date().toISOString().split('T')[0];
+  const today = targetDate || getSyncedIstDateString();
 
   // 1. Fetch Schedule Details
   const { data: scheduleData, error: schedError } = await supabase
@@ -277,36 +279,21 @@ export async function runAbsenceDetection(
               ]);
             }
 
-            // 2. Telephony Voice Call Queueing
-            const { data: existingEvent } = await supabase
-              .from('notification_events')
-              .select('id')
-              .eq('attendance_record_id', absentRecord.id)
-              .eq('event_type', 'ABSENCE_CALL')
-              .maybeSingle();
-
-            if (!existingEvent) {
-              await supabase.from('notification_events').insert([
-                {
-                  attendance_record_id: absentRecord.id,
-                  guardian_id: st.guardian_id,
-                  channel: 'voice',
-                  event_type: 'ABSENCE_CALL',
-                  delivery_status: 'QUEUED',
-                  attempts: 0
-                }
-              ]);
-
-              await supabase.from('call_sessions').insert([
-                {
-                  guardian_id: st.guardian_id,
-                  attendance_record_id: absentRecord.id,
-                  call_status: 'QUEUED',
-                  transfer_requested: false
-                }
-              ]);
-
-              queuedCalls++;
+            // 2. Dispatch Web Push Absence Alert directly to Student's registered device
+            if (st.profile_id) {
+              try {
+                await sendPushNotificationToUsers({
+                  userIds: [st.profile_id],
+                  title: 'CT Hostel - Roll-Call Cutoff Notice',
+                  body: "Evening attendance closed at 10:30 PM IST. You have been recorded as ABSENT for tonight's roll call. Contact your hostel warden immediately.",
+                  notificationType: 'ABSENCE_ALERT',
+                  url: '/?tab=attendance',
+                  eventReference: `absence_cutoff_${st.profile_id}_${today}`
+                });
+                queuedCalls++;
+              } catch (pushErr) {
+                console.warn('Absence push notification error:', pushErr);
+              }
             }
           }
         }

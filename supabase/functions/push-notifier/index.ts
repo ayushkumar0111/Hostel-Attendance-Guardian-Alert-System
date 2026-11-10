@@ -145,27 +145,9 @@ serve(async (req: Request) => {
     // ==========================================================================
     if (pathname.endsWith("/dispatch-event")) {
       const authHeader = req.headers.get("Authorization");
-      if (!authHeader || !authHeader.includes(SUPABASE_SERVICE_ROLE_KEY)) {
-        // Also check if caller is admin user
-        const token = authHeader?.replace("Bearer ", "");
-        const { data: { user } } = await supabaseAdmin.auth.getUser(token || "");
-        
-        let isAdmin = false;
-        if (user) {
-          const { data: prof } = await supabaseAdmin.from("profiles").select("role").eq("id", user.id).single();
-          if (prof?.role === "admin" || prof?.role === "warden") {
-            isAdmin = true;
-          }
-        }
-
-        if (!isAdmin) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), {
-            status: 403,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
-      }
-
+      const token = authHeader?.replace("Bearer ", "");
+      const isServiceRole = authHeader?.includes(SUPABASE_SERVICE_ROLE_KEY);
+      
       const body = await req.json();
       const {
         user_ids,
@@ -181,6 +163,28 @@ serve(async (req: Request) => {
           status: 400,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
+      }
+
+      if (!isServiceRole) {
+        const { data: { user } } = await supabaseAdmin.auth.getUser(token || "");
+        
+        let isAuthorized = false;
+        if (user) {
+          const { data: prof } = await supabaseAdmin.from("profiles").select("role").eq("id", user.id).single();
+          if (prof?.role === "admin" || prof?.role === "warden") {
+            isAuthorized = true;
+          } else if (user_ids.length === 1 && user_ids[0] === user.id) {
+            // Student can notify their own registered device (e.g. ATTENDANCE_VERIFIED)
+            isAuthorized = true;
+          }
+        }
+
+        if (!isAuthorized) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 403,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
       }
 
       // Query active subscriptions for specified users
@@ -251,6 +255,192 @@ serve(async (req: Request) => {
 
       return new Response(
         JSON.stringify({ success: true, delivered: successCount }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // ==========================================================================
+    // ACTION: /process-absences (Headless 10:31 PM IST Finalization & Push Alerts)
+    // ==========================================================================
+    if (pathname.endsWith("/process-absences")) {
+      let isForce = false;
+      let isDryRun = false;
+      try {
+        const body = await req.json();
+        if (body && typeof body.force === "boolean") {
+          isForce = body.force;
+        }
+        if (body && typeof body.dryRun === "boolean") {
+          isDryRun = body.dryRun;
+        }
+      } catch {
+        // Body is optional (e.g. GET or empty POST from pg_net)
+      }
+
+      // Security check: Either valid service role key or admin/warden user session
+      const authHeader = req.headers.get("Authorization");
+      if (!authHeader) {
+        return new Response(JSON.stringify({ error: "Missing authorization header" }), {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const token = authHeader.replace("Bearer ", "");
+      const isServiceKey = Boolean(SUPABASE_SERVICE_ROLE_KEY && token === SUPABASE_SERVICE_ROLE_KEY);
+
+      if (!isServiceKey) {
+        const { data: { user }, error: authErr } = await supabaseAdmin.auth.getUser(token);
+        if (authErr || !user) {
+          return new Response(JSON.stringify({ error: "Invalid or expired authorization token" }), {
+            status: 401,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+
+        // Check if user has warden or admin role
+        const { data: profile } = await supabaseAdmin
+          .from("profiles")
+          .select("role")
+          .eq("id", user.id)
+          .single();
+
+        if (!profile || !["admin", "warden"].includes(profile.role)) {
+          return new Response(
+            JSON.stringify({ error: "Forbidden: Staff or service authority required to trigger absence finalization." }),
+            { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+      }
+
+      // 1. Run database absence finalization procedure
+      let procResult: any = null;
+      let procError: any = null;
+
+      const primaryRes = await supabaseAdmin.rpc("process_nightly_absence_finalization", {
+        p_dry_run: isDryRun,
+        p_force: isForce,
+        p_source: isServiceKey ? "PG_CRON_OR_SERVICE" : "STAFF_EDGE_FUNCTION"
+      });
+
+      if (primaryRes.error) {
+        procError = primaryRes.error;
+        // Fallback to process_all_active_schedules_absences
+        const fallbackRes = await supabaseAdmin.rpc("process_all_active_schedules_absences", {
+          p_force: isForce
+        });
+        procResult = fallbackRes.data;
+        if (!fallbackRes.error) procError = null;
+      } else {
+        procResult = primaryRes.data;
+      }
+
+      // If dry-run, exit early without push notifications
+      if (isDryRun) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            dryRun: true,
+            date: today,
+            dbResult: procResult || null,
+            dbError: procError?.message || null,
+            absenceAlertsDispatched: 0,
+            message: "Dry run simulation complete: No attendance writes or push notifications were dispatched."
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      // Determine today's date in IST
+      const istString = new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
+      const istDate = new Date(istString);
+      const today = `${istDate.getFullYear()}-${String(istDate.getMonth() + 1).padStart(2, "0")}-${String(istDate.getDate()).padStart(2, "0")}`;
+
+      // 2. Fetch all students marked ABSENT for today
+      const { data: absentRecords } = await supabaseAdmin
+        .from("attendance_records")
+        .select("id, student_id, student:students(profile_id, full_name, roll_number)")
+        .eq("attendance_date", today)
+        .eq("status", "ABSENT");
+
+      let alertCount = 0;
+      if (absentRecords && absentRecords.length > 0) {
+        // Collect absent profile IDs
+        const absentProfileIds = absentRecords
+          .map((r: any) => r.student?.profile_id)
+          .filter(Boolean);
+
+        if (absentProfileIds.length > 0) {
+          // Fetch active subscriptions with absence alerts enabled
+          const { data: subs } = await supabaseAdmin
+            .from("push_subscriptions")
+            .select("*")
+            .in("user_id", absentProfileIds)
+            .eq("is_active", true)
+            .eq("absence_alerts_enabled", true);
+
+          if (subs && subs.length > 0) {
+            const pushPayload = JSON.stringify({
+              title: "CT Hostel - Roll-Call Cutoff Notice",
+              body: "Evening attendance closed at 10:30 PM IST. You have been recorded as ABSENT for tonight's roll call. Contact your hostel warden immediately.",
+              icon: "/icon-192.png",
+              badge: "/icon-192.png",
+              url: "/?tab=attendance",
+            });
+
+            for (const sub of subs) {
+              const eventRef = `absence_cutoff_${sub.user_id}_${today}`;
+              // Check if already dispatched today
+              const { data: existingLog } = await supabaseAdmin
+                .from("push_notification_logs")
+                .select("id")
+                .eq("event_reference", eventRef)
+                .maybeSingle();
+
+              if (!existingLog) {
+                try {
+                  const pushSub = {
+                    endpoint: sub.endpoint,
+                    keys: { p256dh: sub.p256dh, auth: sub.auth },
+                  };
+                  await webpush.sendNotification(pushSub, pushPayload);
+                  alertCount++;
+
+                  await supabaseAdmin.from("push_notification_logs").insert([
+                    {
+                      user_id: sub.user_id,
+                      subscription_id: sub.id,
+                      notification_type: "ABSENCE_ALERT",
+                      title: "CT Hostel - Roll-Call Cutoff Notice",
+                      body: "Student marked ABSENT at 10:31 PM cutoff",
+                      event_reference: eventRef,
+                      delivery_status: "SENT",
+                      status_code: 200,
+                    },
+                  ]);
+                } catch (pushErr: any) {
+                  console.warn("[Absence Push Error]", pushErr?.statusCode, pushErr?.message);
+                  if (pushErr?.statusCode === 410 || pushErr?.statusCode === 404) {
+                    await supabaseAdmin
+                      .from("push_subscriptions")
+                      .update({ is_active: false })
+                      .eq("id", sub.id);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          date: today,
+          dbResult: procResult || null,
+          dbError: procError?.message || null,
+          absenceAlertsDispatched: alertCount,
+        }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }

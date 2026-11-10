@@ -25,6 +25,8 @@ import {
   GeofenceConfig
 } from '../../lib/geofencing';
 import { supabase, isSupabaseConfigured } from '../../lib/supabase';
+import { getSyncedIstDate, getSyncedIstDateString } from '../../lib/serverTime';
+import { sendPushNotificationToUsers } from '../../lib/webPush';
 
 interface FaceAttendanceModalProps {
   student: Student;
@@ -243,8 +245,8 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
       return;
     }
 
-    // 0. Enforce Attendance Window: 9:30 PM to 10:30 PM IST Only
-    const istNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    // 0. Enforce Attendance Window: 9:30 PM to 10:30 PM IST Only (Synchronized Server Time)
+    const istNow = getSyncedIstDate();
     const currentIstMinutes = istNow.getHours() * 60 + istNow.getMinutes();
     const [startH, startM] = (activeSchedule.start_time || '21:30:00').split(':').map(Number);
     const [deadH, deadM] = (activeSchedule.deadline_time || '22:30:00').split(':').map(Number);
@@ -409,7 +411,7 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
         return;
       }
 
-      const today = new Date().toISOString().split('T')[0];
+      const today = getSyncedIstDateString();
       const submittedAt = new Date().toISOString();
 
       // 3.1 Try Server-Side Stored Procedure (RPC) First for Trusted Backend Enforcement
@@ -525,6 +527,28 @@ export const FaceAttendanceModal: React.FC<FaceAttendanceModalProps> = ({
       });
 
       stopCamera();
+
+      // Trigger Web Push status notification to the resident
+      if (student.profile_id) {
+        try {
+          const formattedTime = new Date().toLocaleTimeString('en-IN', {
+            timeZone: 'Asia/Kolkata',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true
+          });
+          sendPushNotificationToUsers({
+            userIds: [student.profile_id],
+            title: 'CT Hostel - Attendance Verified',
+            body: `Your attendance has been confirmed present within campus bounds at ${formattedTime} IST.`,
+            notificationType: 'ATTENDANCE_VERIFIED',
+            url: '/?tab=attendance',
+            eventReference: `att_verified_${student.id}_${today}`
+          }).catch((err) => console.warn('Attendance WebPush dispatch notice:', err));
+        } catch {
+          // Gracefully continue
+        }
+      }
 
       // Trigger parent callback after brief animation
       setTimeout(() => {

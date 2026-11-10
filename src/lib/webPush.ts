@@ -6,7 +6,7 @@
 // ==============================================================================
 
 import { supabase } from './supabase';
-import { PushDeviceType, PushSubscriptionRecord } from '../types/database';
+import { PushDeviceType, PushSubscriptionRecord, PushNotificationType } from '../types/database';
 
 // Production VAPID Public Key (Safe for client-side inclusion)
 export const DEFAULT_VAPID_PUBLIC_KEY =
@@ -299,6 +299,103 @@ export async function sendTestPushNotification(): Promise<{ success: boolean; me
     return {
       success: false,
       message: err instanceof Error ? err.message : 'Network error sending test notification.'
+    };
+  }
+}
+
+/**
+ * Dispatches an authenticated Web Push notification to one or more user profiles
+ * via the Supabase Edge Function (/dispatch-event).
+ * Restricted to authenticated Wardens and Administrators.
+ */
+export async function sendPushNotificationToUsers({
+  userIds,
+  title,
+  body,
+  notificationType = 'ATTENDANCE_REMINDER',
+  url = '/',
+  eventReference
+}: {
+  userIds: string[];
+  title: string;
+  body: string;
+  notificationType?: PushNotificationType;
+  url?: string;
+  eventReference?: string;
+}): Promise<{ success: boolean; delivered: number; totalRequested: number; message: string; note?: string }> {
+  try {
+    if (!userIds || userIds.length === 0) {
+      return {
+        success: false,
+        delivered: 0,
+        totalRequested: 0,
+        message: 'No student accounts selected.'
+      };
+    }
+
+    const { data: sessionData } = await supabase.auth.getSession();
+    const token = sessionData?.session?.access_token;
+
+    if (!token) {
+      return {
+        success: false,
+        delivered: 0,
+        totalRequested: userIds.length,
+        message: 'You must be signed in as Warden or Admin to dispatch notifications.'
+      };
+    }
+
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+    const functionUrl = `${supabaseUrl}/functions/v1/push-notifier/dispatch-event`;
+
+    const generatedRef =
+      eventReference ||
+      `warden_push_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    const response = await fetch(functionUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        user_ids: userIds,
+        notification_type: notificationType,
+        title,
+        body,
+        url,
+        event_reference: generatedRef
+      })
+    });
+
+    if (response.ok) {
+      const resJson = await response.json();
+      const delivered = typeof resJson.delivered === 'number' ? resJson.delivered : 0;
+      return {
+        success: true,
+        delivered,
+        totalRequested: userIds.length,
+        message:
+          delivered > 0
+            ? `Successfully delivered push alert to ${delivered} active device(s)!`
+            : 'No active device subscriptions found for the selected student(s).',
+        note: resJson.note
+      };
+    } else {
+      const errText = await response.text();
+      return {
+        success: false,
+        delivered: 0,
+        totalRequested: userIds.length,
+        message: `Notification dispatch failed (${response.status}): ${errText || response.statusText}`
+      };
+    }
+  } catch (err: unknown) {
+    return {
+      success: false,
+      delivered: 0,
+      totalRequested: userIds.length,
+      message: err instanceof Error ? err.message : 'Network error dispatching push notification.'
     };
   }
 }

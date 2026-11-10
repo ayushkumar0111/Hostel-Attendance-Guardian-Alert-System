@@ -150,6 +150,25 @@ export async function processSequentialCallQueue(
     currentProgress.lastMessage = `[${i + 1}/${queueItems.length}] Calling ${guardian?.full_name || 'Guardian'} for ${student?.full_name || 'Student'} (${student?.roll_number || 'N/A'})...`;
     onProgress?.(currentProgress);
 
+    // Check Guardian Notification Consent Status (Requirement: Do not dispatch calls without explicit consent)
+    if (guardian && guardian.notification_consent_status !== 'CONSENTED') {
+      const consentStatus = guardian.notification_consent_status || 'PENDING';
+      currentProgress.currentStatus = 'FAILED';
+      currentProgress.lastMessage = `[${i + 1}/${queueItems.length}] Skipped call to ${guardian.full_name || 'Guardian'}: Consent status is '${consentStatus}'. Automated calls require verified consent.`;
+      
+      await supabase
+        .from('call_sessions')
+        .update({
+          call_status: 'FAILED',
+          notes: `Skipped: Guardian notification consent is '${consentStatus}'. Automated outbound calls require verified consent.`
+        })
+        .eq('id', session.id);
+
+      failedCount++;
+      onProgress?.(currentProgress);
+      continue;
+    }
+
     try {
       // 1. Mark call session as RINGING in database
       await supabase
