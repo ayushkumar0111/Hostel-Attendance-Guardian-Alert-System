@@ -43,8 +43,14 @@ import {
   ShieldAlert,
   Camera,
   Volume2,
-  Radio
+  Radio,
+  Bell,
+  BellRing,
+  Smartphone,
+  FileSpreadsheet
 } from 'lucide-react';
+import { BulkStudentUploadModal } from './BulkStudentUploadModal';
+import { validateIndianMobile } from '../../lib/studentImportUtils';
 import { FaceEnrollmentModal } from '../biometrics/FaceEnrollmentModal';
 import { hasStudentFaceTemplate } from '../../lib/faceRecognition';
 import { runAbsenceDetection } from '../../lib/absenceDetection';
@@ -55,6 +61,10 @@ import {
   generateHindiAbsenceVoiceScript
 } from '../../lib/telephony';
 import { processSequentialCallQueue, CallQueueProgress } from '../../lib/callQueue';
+import { SendPushNotificationModal, StudentRecipient } from '../notifications/SendPushNotificationModal';
+import { sendTestPushNotification } from '../../lib/webPush';
+import { AttendanceCountdownTimer } from '../student/AttendanceCountdownTimer';
+import { getSyncedIstDateString } from '../../lib/serverTime';
 
 export const AdminDashboard: React.FC = () => {
   const { user } = useAuth();
@@ -93,6 +103,7 @@ export const AdminDashboard: React.FC = () => {
   const [newScheduleGrace, setNewScheduleGrace] = useState<number>(1);
 
   const [showEnrollStudent, setShowEnrollStudent] = useState<boolean>(false);
+  const [showBulkUpload, setShowBulkUpload] = useState<boolean>(false);
   const [newStudentName, setNewStudentName] = useState<string>('');
   const [newRollNumber, setNewRollNumber] = useState<string>('');
   const [newStudentCode, setNewStudentCode] = useState<string>('');
@@ -166,7 +177,7 @@ export const AdminDashboard: React.FC = () => {
   const [assignIsPrimary, setAssignIsPrimary] = useState<boolean>(true);
 
   // Attendance Tab Filters & Roll Call Modal States
-  const [attendanceDate, setAttendanceDate] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [attendanceDate, setAttendanceDate] = useState<string>(getSyncedIstDateString());
   const [attendanceHostelFilter, setAttendanceHostelFilter] = useState<string>('');
   const [attendanceStatusFilter, setAttendanceStatusFilter] = useState<string>('');
   const [attendanceStudentSearch, setAttendanceStudentSearch] = useState<string>('');
@@ -201,6 +212,14 @@ export const AdminDashboard: React.FC = () => {
   const [ivrProcessing, setIvrProcessing] = useState<boolean>(false);
   const [callQueueProgress, setCallQueueProgress] = useState<CallQueueProgress | null>(null);
 
+  // Web Push Notification States
+  const [showPushModal, setShowPushModal] = useState<boolean>(false);
+  const [pushModalSingleStudent, setPushModalSingleStudent] = useState<StudentRecipient | null>(null);
+  const [pushModalBatchList, setPushModalBatchList] = useState<StudentRecipient[]>([]);
+  const [pushLogs, setPushLogs] = useState<any[]>([]);
+  const [isSendingTestPush, setIsSendingTestPush] = useState<boolean>(false);
+  const [testPushMessage, setTestPushMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
   const loadData = async () => {
     if (!configured) return;
     setIsLoading(true);
@@ -217,7 +236,8 @@ export const AdminDashboard: React.FC = () => {
         attendanceRes,
         leavesRes,
         alertsRes,
-        wardenAssignmentsRes
+        wardenAssignmentsRes,
+        pushLogsRes
       ] = await Promise.all([
         supabase.from('hostels').select('*').order('name'),
         supabase.from('hostel_blocks').select('*, hostels(name)').order('block_name'),
@@ -227,10 +247,11 @@ export const AdminDashboard: React.FC = () => {
         supabase.from('students').select('*, hostels(name), guardians(*)').order('created_at', { ascending: false }),
         supabase.from('hostel_rooms').select('*, hostels(name), block:hostel_blocks(block_name)').order('room_number'),
         supabase.from('room_allocations').select('*, student:students(full_name, roll_number), room:hostel_rooms(room_number, hostels(name))').order('created_at', { ascending: false }),
-        supabase.from('attendance_records').select('*, students(full_name, roll_number, room_number, hostel_id, hostels(name)), schedule:attendance_schedules(name)').eq('attendance_date', attendanceDate),
+        supabase.from('attendance_records').select('*, students(full_name, roll_number, room_number, hostel_id, profile_id, hostels(name)), schedule:attendance_schedules(name), verification_submissions(*)').eq('attendance_date', attendanceDate),
         supabase.from('leave_requests').select('*, students(full_name, roll_number, room_number)').order('created_at', { ascending: false }),
         supabase.from('notification_events').select('*').order('created_at', { ascending: false }).limit(25),
-        supabase.from('warden_hostel_assignments').select('*, hostels(name)').order('assigned_at', { ascending: false })
+        supabase.from('warden_hostel_assignments').select('*, hostels(name)').order('assigned_at', { ascending: false }),
+        supabase.from('push_notification_logs').select('*').order('created_at', { ascending: false }).limit(50)
       ]);
 
       if (hostelsRes.data) setHostels(hostelsRes.data as Hostel[]);
@@ -276,10 +297,79 @@ export const AdminDashboard: React.FC = () => {
       }
       if (alertsRes.data) setRecentAlerts(alertsRes.data as NotificationEvent[]);
       if (wardenAssignmentsRes.data) setWardenAssignments(wardenAssignmentsRes.data as WardenHostelAssignment[]);
+      if (pushLogsRes && pushLogsRes.data) setPushLogs(pushLogsRes.data);
     } catch (err) {
       console.warn('Error loading admin records:', err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleOpenPushForSingleStudent = (st: Student | any) => {
+    setPushModalSingleStudent({
+      id: st.id,
+      full_name: st.full_name || 'Enrolled Student',
+      roll_number: st.roll_number || 'N/A',
+      profile_id: st.profile_id || null,
+      room_number: st.room_number || '-',
+      hostel_name: st.hostel?.name || st.hostels?.name || 'Hostel'
+    });
+    setPushModalBatchList([]);
+    setShowPushModal(true);
+  };
+
+  const handleOpenPushForAbsentStudents = () => {
+    const absentRecords = todayAttendance.filter((r) => r.status === 'ABSENT');
+    if (absentRecords.length === 0) {
+      alert(`No students are currently marked as ABSENT for ${attendanceDate}.`);
+      return;
+    }
+
+    const studentMap = new Map<string, StudentRecipient>();
+    absentRecords.forEach((rec) => {
+      const st = students.find((s) => s.id === rec.student_id) || (rec.student as any);
+      if (st && !studentMap.has(st.id)) {
+        studentMap.set(st.id, {
+          id: st.id,
+          full_name: st.full_name || 'Enrolled Student',
+          roll_number: st.roll_number || 'N/A',
+          profile_id: st.profile_id || null,
+          room_number: st.room_number || '-',
+          hostel_name: st.hostel?.name || st.hostels?.name || 'Hostel'
+        });
+      }
+    });
+
+    const list = Array.from(studentMap.values());
+    setPushModalBatchList(list);
+    setPushModalSingleStudent(null);
+    setShowPushModal(true);
+  };
+
+  const handleSendTestPush = async () => {
+    setIsSendingTestPush(true);
+    setTestPushMessage(null);
+    try {
+      const res = await sendTestPushNotification();
+      if (res.success) {
+        setTestPushMessage({
+          type: 'success',
+          text: 'Test Web Push Notification dispatched! If permissions are granted, check your device banner.'
+        });
+        await loadData();
+      } else {
+        setTestPushMessage({
+          type: 'error',
+          text: res.message || 'Failed to dispatch test notification. Ensure browser permission is enabled.'
+        });
+      }
+    } catch (err: unknown) {
+      setTestPushMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Error sending test push notification.'
+      });
+    } finally {
+      setIsSendingTestPush(false);
     }
   };
 
@@ -307,7 +397,44 @@ export const AdminDashboard: React.FC = () => {
         return;
       }
 
-      // Check if hostel name already exists
+      // Step 1: Pre-flight Authentication & Admin Role Verification
+      const { data: { user: currentUser }, error: authUserError } = await supabase.auth.getUser();
+
+      if (authUserError || !currentUser) {
+        const errorMsg = 'Authentication Required: You are currently viewing in Preview Mode without an active session. Please sign in with the Administrator account to save hostel facilities.';
+        setFormStatus(errorMsg);
+        console.warn('[Hostel Creation Blocked]', errorMsg);
+        setIsSubmitting(false);
+        return;
+      }
+
+      // Step 2: Verify role returned by current_user_role() RPC in PostgreSQL
+      let dbRole: string | null = null;
+      try {
+        const { data: roleResult, error: roleError } = await supabase.rpc('current_user_role');
+        if (!roleError && roleResult) {
+          dbRole = roleResult;
+        }
+      } catch (roleEx) {
+        console.warn('[Hostel Creation] Failed to probe current_user_role:', roleEx);
+      }
+
+      // Log safe diagnostics (No secrets or tokens exposed)
+      console.info('[Hostel Creation Pre-flight]', {
+        hasSession: Boolean(currentUser),
+        userIdMasked: `${currentUser.id.slice(0, 8)}...`,
+        isAdminId: currentUser.id === '1fc7220a-0680-419a-9833-e1fa1e10bfc4',
+        databaseRole: dbRole || 'unknown'
+      });
+
+      if (dbRole !== 'admin') {
+        const roleMsg = `Access Denied: Current session role in database is '${dbRole || 'non-admin'}'. PostgreSQL Row Level Security (RLS) strictly requires an active 'admin' role. Please sign in with the Administrator account.`;
+        setFormStatus(roleMsg);
+        setIsSubmitting(false);
+        return;
+      }
+
+      // Step 3: Check if hostel name already exists
       const { data: existingHostel } = await supabase
         .from('hostels')
         .select('id')
@@ -320,21 +447,30 @@ export const AdminDashboard: React.FC = () => {
         return;
       }
 
+      // Step 4: Radius calculation (Measured campus boundary extent 435m + 100m margin = 535m)
+      const measuredCampusExtentMeters = 435;
+      const safetyMarginMeters = 100;
+      const calculatedBoundaryRadius = measuredCampusExtentMeters + safetyMarginMeters; // 535m
+      const effectiveRadius = Number(newHostelRadius) > 0 ? Number(newHostelRadius) : calculatedBoundaryRadius;
+
+      // Step 5: Insert with verified Shahpur campus coordinates & geofence radius
       const { error } = await supabase.from('hostels').insert([
         {
           name: newHostelName.trim(),
           institution_name: 'CT GROUP OF INSTITUTIONS',
-          campus_unit: 'CT',
+          campus_unit: 'CTIEMT',
           warden_contact: newHostelWardenPhone.trim() || null,
-          geofence_radius_meters: Number(newHostelRadius) || 150,
+          reference_latitude: 31.236872,
+          reference_longitude: 75.553745,
+          geofence_radius_meters: effectiveRadius,
           is_active: true
         }
       ]);
 
       if (error) {
-        setFormStatus(`Error: ${error.message}`);
+        setFormStatus(`Database Error (${error.code || '42501'}): ${error.message}. Please verify your Administrator session privileges.`);
       } else {
-        alert(`Hostel facility "${newHostelName.trim()}" created successfully!`);
+        alert(`Hostel facility "${newHostelName.trim()}" created successfully with Shahpur geofence (${effectiveRadius}m radius)!`);
         setNewHostelName('');
         setNewHostelWardenPhone('');
         setShowAddHostel(false);
@@ -353,6 +489,14 @@ export const AdminDashboard: React.FC = () => {
     setIsSubmitting(true);
     setFormStatus(null);
     try {
+      // Pre-flight auth check
+      const { data: { user: currentUser } } = await supabase.auth.getUser();
+      if (!currentUser) {
+        setFormStatus('Authentication Required: Please sign in with an Administrator or Warden account to add attendance schedules.');
+        setIsSubmitting(false);
+        return;
+      }
+
       const selectedHostelId = newScheduleHostelId || (hostels[0]?.id ?? null);
       if (!selectedHostelId) {
         setFormStatus('Please create at least one hostel before adding an attendance schedule.');
@@ -407,6 +551,13 @@ export const AdminDashboard: React.FC = () => {
         return;
       }
 
+      const phoneValidation = validateIndianMobile(newGuardianPhone.trim());
+      if (!phoneValidation.isValid) {
+        setFormStatus(phoneValidation.error || 'Invalid Indian mobile phone number.');
+        setIsSubmitting(false);
+        return;
+      }
+
       if (hostels.length === 0) {
         setFormStatus('Please create at least one hostel before enrolling students.');
         setIsSubmitting(false);
@@ -456,7 +607,7 @@ export const AdminDashboard: React.FC = () => {
           {
             full_name: newGuardianName.trim(),
             relationship: newGuardianRelation,
-            phone_number: newGuardianPhone.trim(),
+            phone_number: phoneValidation.normalized,
             preferred_language: newGuardianLanguage,
             notification_consent_status: (newVoiceConsent || newSmsConsent) ? 'CONSENTED' : 'REVOKED'
           }
@@ -1279,6 +1430,15 @@ export const AdminDashboard: React.FC = () => {
 
         <div className="flex items-center space-x-2.5 flex-wrap gap-2">
           <button
+            onClick={handleSendTestPush}
+            disabled={isSendingTestPush}
+            className="flex items-center space-x-1.5 px-3 py-2 text-xs font-bold bg-ct-navy hover:bg-ct-navy-light text-white rounded-lg shadow-sm transition-colors disabled:opacity-50"
+            title="Dispatch a test Web Push notification to this browser"
+          >
+            <Smartphone className="w-3.5 h-3.5 text-ct-gold" />
+            <span>{isSendingTestPush ? 'Testing...' : 'Test Push'}</span>
+          </button>
+          <button
             onClick={() => loadData()}
             className="flex items-center space-x-1.5 px-3 py-2 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors"
             title="Refresh database records"
@@ -1292,6 +1452,14 @@ export const AdminDashboard: React.FC = () => {
           >
             <UserPlus className="w-3.5 h-3.5 text-white" />
             <span>Enroll Student</span>
+          </button>
+          <button
+            onClick={() => setShowBulkUpload(true)}
+            className="flex items-center space-x-1.5 px-3 py-2 text-xs font-bold bg-emerald-800 hover:bg-emerald-900 text-emerald-100 rounded-lg shadow-sm transition-colors border border-emerald-600/40"
+            title="Import student roster in bulk from Excel (.xlsx) or CSV"
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-300" />
+            <span>Bulk Upload (Excel/CSV)</span>
           </button>
           <button
             onClick={() => setShowAddHostel(true)}
@@ -1501,7 +1669,31 @@ export const AdminDashboard: React.FC = () => {
       {activeTab === 'overview' && (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
-            <h3 className="text-sm font-bold text-slate-900">Institutional Attendance &amp; Resident Summary</h3>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Institutional Attendance &amp; Resident Summary</h3>
+                <p className="text-xs text-slate-500 mt-0.5">Campus accommodations, roll-call schedules, and resident management</p>
+              </div>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setShowBulkUpload(true)}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-emerald-800 hover:bg-emerald-900 text-white rounded-lg shadow-sm transition-colors border border-emerald-600/50"
+                  title="Import student roster in bulk from Excel (.xlsx) or CSV"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-300" />
+                  <span>Bulk Upload (Excel/CSV)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowEnrollStudent(true)}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg shadow-sm transition-colors"
+                >
+                  <UserPlus className="w-3.5 h-3.5 text-white" />
+                  <span>Enroll Student</span>
+                </button>
+              </div>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
               <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
                 <span className="font-bold text-slate-700">Residential Hostels</span>
@@ -1524,7 +1716,7 @@ export const AdminDashboard: React.FC = () => {
           </div>
 
           {/* Quick Action Cards */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <div
               onClick={() => setShowEnrollStudent(true)}
               className="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm hover:border-emerald-500 cursor-pointer transition-all space-y-2"
@@ -1535,6 +1727,19 @@ export const AdminDashboard: React.FC = () => {
               <h4 className="font-bold text-slate-900 text-sm">Enroll New Student</h4>
               <p className="text-xs text-slate-500 leading-relaxed">
                 Add an admitted student, link guardian emergency phone, and assign hostel room.
+              </p>
+            </div>
+
+            <div
+              onClick={() => setShowBulkUpload(true)}
+              className="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm hover:border-emerald-500 cursor-pointer transition-all space-y-2"
+            >
+              <div className="w-9 h-9 rounded-xl bg-emerald-50 flex items-center justify-center text-emerald-700">
+                <FileSpreadsheet className="w-5 h-5" />
+              </div>
+              <h4 className="font-bold text-slate-900 text-sm">Bulk Excel / CSV Upload</h4>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Import complete batch student rosters, rooms, and guardian numbers from Excel or CSV files.
               </p>
             </div>
 
@@ -1618,11 +1823,22 @@ export const AdminDashboard: React.FC = () => {
               </select>
 
               <button
+                type="button"
                 onClick={() => setShowEnrollStudent(true)}
                 className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg shadow-sm transition-colors shrink-0"
               >
                 <UserPlus className="w-3.5 h-3.5 text-white" />
                 <span>Enroll</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowBulkUpload(true)}
+                className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-emerald-800 hover:bg-emerald-900 text-white rounded-lg shadow-sm transition-colors shrink-0 border border-emerald-600/50"
+                title="Import student roster in bulk from Excel (.xlsx) or CSV"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-300" />
+                <span>Bulk Upload (Excel/CSV)</span>
               </button>
             </div>
           </div>
@@ -1717,6 +1933,13 @@ export const AdminDashboard: React.FC = () => {
                       </td>
                       <td className="py-2.5 px-3 text-right">
                         <div className="flex items-center justify-end space-x-1.5">
+                          <button
+                            onClick={() => handleOpenPushForSingleStudent(s)}
+                            className="p-1 text-slate-500 hover:text-ct-navy hover:bg-blue-50 rounded transition-colors"
+                            title="Send Web Push Alert to Student"
+                          >
+                            <Bell className="w-3.5 h-3.5 text-ct-navy" />
+                          </button>
                           <button
                             onClick={() => setStudentForBiometricEnroll(s)}
                             className={`p-1 rounded transition-colors ${
@@ -2166,7 +2389,15 @@ export const AdminDashboard: React.FC = () => {
 
       {/* Tab: ATTENDANCE RECORDS */}
       {activeTab === 'attendance' && (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+        <div className="space-y-4">
+          {/* Live Roll-Call Attendance Countdown & Central Staff Monitor */}
+          <AttendanceCountdownTimer
+            schedule={schedules[0] || null}
+            allowSimulation={true}
+            portalContext="staff"
+          />
+
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h3 className="text-sm font-bold text-slate-900">Central Attendance Ledger &amp; Roll-Call History</h3>
@@ -2232,6 +2463,15 @@ export const AdminDashboard: React.FC = () => {
               >
                 <Clock className={`w-3.5 h-3.5 text-ct-gold ${isRunningAbsenceDetection ? 'animate-spin' : ''}`} />
                 <span>{isRunningAbsenceDetection ? 'Evaluating...' : 'Detect Absences'}</span>
+              </button>
+
+              <button
+                onClick={handleOpenPushForAbsentStudents}
+                className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-rose-700 hover:bg-rose-800 text-white rounded-lg shadow-sm transition-colors cursor-pointer"
+                title="Send Web Push alert to all absent students for this date"
+              >
+                <BellRing className="w-3.5 h-3.5 text-rose-200" />
+                <span>Notify Absent ({todayAttendance.filter((r) => r.status === 'ABSENT').length})</span>
               </button>
 
               <button
@@ -2409,6 +2649,17 @@ export const AdminDashboard: React.FC = () => {
                             >
                               Excuse
                             </button>
+                            <button
+                              onClick={() => {
+                                const st = students.find((s) => s.id === rec.student_id) || rec.student;
+                                if (st) handleOpenPushForSingleStudent(st);
+                              }}
+                              title="Send Web Push alert to this student"
+                              className="px-2 py-1 rounded text-[10px] font-bold bg-blue-50 text-blue-800 hover:bg-blue-100 border border-blue-200 inline-flex items-center gap-1 transition-colors cursor-pointer"
+                            >
+                              <Bell className="w-3 h-3 text-blue-700" />
+                              <span>Notify</span>
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -2429,7 +2680,8 @@ export const AdminDashboard: React.FC = () => {
             );
           })()}
         </div>
-      )}
+      </div>
+    )}
 
       {/* Tab: SCHEDULES */}
       {activeTab === 'schedules' && (
@@ -2820,6 +3072,166 @@ export const AdminDashboard: React.FC = () => {
               When unconfigured, all alert events safely persist in the database in <code className="bg-slate-200 px-1 py-0.5 rounded font-mono">QUEUED</code> status. No simulated or mock calls are made.
             </p>
           </div>
+
+          {/* Web Push Notification Delivery Ledger & Server-Side VAPID Log */}
+          <div className="pt-6 border-t border-slate-200 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center space-x-2">
+                  <BellRing className="w-4 h-4 text-ct-navy" />
+                  <h4 className="text-sm font-bold text-slate-900">Student Web Push Notification Delivery Ledger</h4>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Real-time push delivery logs from Supabase Edge Function &amp; Web Push VAPID Service
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={handleSendTestPush}
+                  disabled={isSendingTestPush}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-ct-navy hover:bg-ct-navy-light text-white rounded-lg shadow-sm transition-colors disabled:opacity-50 cursor-pointer"
+                  title="Send test push notification to current browser"
+                >
+                  <Smartphone className="w-3.5 h-3.5 text-ct-gold" />
+                  <span>{isSendingTestPush ? 'Testing...' : 'Send Test Notification'}</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    const allRecipients: StudentRecipient[] = students.map((s) => ({
+                      id: s.id,
+                      full_name: s.full_name,
+                      roll_number: s.roll_number,
+                      profile_id: s.profile_id,
+                      room_number: s.room_number,
+                      hostel_name: s.hostel?.name || s.hostels?.name
+                    }));
+                    setPushModalBatchList(allRecipients);
+                    setPushModalSingleStudent(null);
+                    setShowPushModal(true);
+                  }}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold bg-slate-800 hover:bg-slate-900 text-white rounded-lg shadow-sm transition-colors cursor-pointer"
+                >
+                  <Bell className="w-3.5 h-3.5 text-ct-gold" />
+                  <span>Compose Push Alert</span>
+                </button>
+              </div>
+            </div>
+
+            {testPushMessage && (
+              <div
+                className={`p-3 rounded-lg text-xs font-medium flex items-center justify-between ${
+                  testPushMessage.type === 'success'
+                    ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                    : 'bg-rose-50 text-rose-800 border border-rose-200'
+                }`}
+              >
+                <span>{testPushMessage.text}</span>
+                <button onClick={() => setTestPushMessage(null)} className="text-xs underline font-bold ml-2">
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+            {pushLogs.length > 0 ? (
+              <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50 text-slate-600 font-semibold">
+                      <th className="py-2.5 px-3">Timestamp</th>
+                      <th className="py-2.5 px-3">Recipient Student</th>
+                      <th className="py-2.5 px-3">Notification Type</th>
+                      <th className="py-2.5 px-3">Title &amp; Message</th>
+                      <th className="py-2.5 px-3">Delivery Status</th>
+                      <th className="py-2.5 px-3">Delivery Response / Details</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {pushLogs.map((log) => {
+                      const st = students.find((s) => s.profile_id === log.user_id);
+                      return (
+                        <tr key={log.id} className="hover:bg-slate-50">
+                          <td className="py-2.5 px-3 font-mono text-slate-600 whitespace-nowrap">
+                            {new Date(log.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                            <span className="block text-[10px] text-slate-400">
+                              {new Date(log.created_at).toLocaleDateString()}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3">
+                            {st ? (
+                              <div>
+                                <span className="font-semibold text-slate-900 block">{st.full_name}</span>
+                                <span className="font-mono text-[10px] text-slate-500">Roll: {st.roll_number} • Room {st.room_number}</span>
+                              </div>
+                            ) : (
+                              <div>
+                                <span className="font-mono text-slate-700 block">System / User</span>
+                                <span className="font-mono text-[10px] text-slate-400">{log.user_id.slice(0, 12)}...</span>
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-800 border border-blue-200 uppercase">
+                              {log.notification_type || 'ALERT'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 max-w-xs">
+                            <div className="font-semibold text-slate-800 truncate">{log.title}</div>
+                            <div className="text-[11px] text-slate-500 truncate">{log.body}</div>
+                          </td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold ${
+                                log.delivery_status === 'SENT'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : log.delivery_status === 'FAILED'
+                                  ? 'bg-rose-100 text-rose-800'
+                                  : 'bg-amber-100 text-amber-800'
+                              }`}
+                            >
+                              {log.delivery_status === 'SENT' ? (
+                                <>
+                                  <Check className="w-3 h-3 text-emerald-700" />
+                                  <span>Delivered</span>
+                                </>
+                              ) : log.delivery_status === 'FAILED' ? (
+                                <>
+                                  <X className="w-3 h-3 text-rose-700" />
+                                  <span>Failed</span>
+                                </>
+                              ) : (
+                                <span>{log.delivery_status}</span>
+                              )}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-[11px]">
+                            {log.error_message ? (
+                              <span className="text-rose-600 font-mono text-[10px] bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200 block truncate max-w-xs" title={log.error_message}>
+                                {log.error_message}
+                              </span>
+                            ) : log.status_code ? (
+                              <span className="text-emerald-700 font-mono text-[10px]">HTTP {log.status_code} OK (Delivered)</span>
+                            ) : (
+                              <span className="text-slate-400">-</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="py-8 text-center rounded-xl bg-slate-50 border border-dashed border-slate-300">
+                <BellRing className="w-6 h-6 text-slate-400 mx-auto mb-1.5" />
+                <p className="text-xs font-semibold text-slate-700">No Web Push Logs Yet</p>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Push notifications sent to students or via test dispatch will appear here with real-time VAPID delivery status.
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -3103,7 +3515,10 @@ export const AdminDashboard: React.FC = () => {
               </div>
 
               <div>
-                <label className="block font-semibold text-slate-700 mb-1">Geofence Tolerance (Meters)</label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block font-semibold text-slate-700">Geofence Tolerance (Meters)</label>
+                  <span className="text-[10px] text-slate-500 font-mono">435m extent + 100m margin = 535m</span>
+                </div>
                 <input
                   type="number"
                   min="50"
@@ -3112,6 +3527,9 @@ export const AdminDashboard: React.FC = () => {
                   onChange={(e) => setNewHostelRadius(Number(e.target.value))}
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-ct-navy"
                 />
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Shahpur Campus Pin: 31.236872, 75.553745. Radius matches verified road boundary extent (435m) plus 100m margin.
+                </p>
               </div>
 
               {formStatus && (
@@ -3510,6 +3928,19 @@ export const AdminDashboard: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* ===================================================================== */}
+      {/* MODAL 3B: Bulk Student Import via Excel / CSV */}
+      {/* ===================================================================== */}
+      <BulkStudentUploadModal
+        isOpen={showBulkUpload}
+        onClose={() => setShowBulkUpload(false)}
+        hostels={hostels}
+        selectedHostelId={selectedHostelFilter || (hostels.length > 0 ? hostels[0].id : undefined)}
+        onSuccess={() => {
+          loadData();
+        }}
+      />
 
       {/* ===================================================================== */}
       {/* MODAL 4: Assign Warden to Hostel */}
@@ -4667,6 +5098,21 @@ export const AdminDashboard: React.FC = () => {
           </div>
         );
       })()}
+
+      {/* Web Push Notification Modal */}
+      <SendPushNotificationModal
+        isOpen={showPushModal}
+        onClose={() => {
+          setShowPushModal(false);
+          setPushModalSingleStudent(null);
+          setPushModalBatchList([]);
+        }}
+        singleStudent={pushModalSingleStudent}
+        studentList={pushModalBatchList}
+        onSuccess={async () => {
+          await loadData();
+        }}
+      />
     </div>
   );
 };
